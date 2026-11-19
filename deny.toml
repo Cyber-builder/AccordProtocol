@@ -1,0 +1,58 @@
+# Config for cargo-deny
+#
+# Advisories: newer cargo-deny versions removed vulnerability/notice lint
+# levels. unmaintained/unsound now select which crates can fail the check
+# (all | workspace | transitive | none), not warn/deny/allow.
+
+[advisories]
+db-path = "~/.cargo/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Match previous "warn" intent: do not fail CI on unmaintained/unsound crates.
+unmaintained = "none"
+unsound = "none"
+yanked = "warn"
+# Reviewed exceptions mirrored from .cargo/audit.toml: each advisory has no
+# compatible fixed version yet, and the comment there records the upstream bump
+# that removes it.
+ignore = [
+  "RUSTSEC-2026-0387", # crypto-bigint via elliptic-curve/soroban-env-host
+  "RUSTSEC-2026-0459", # libsqlite3-sys pinned by sqlx-sqlite 0.8.x
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+# Transitive dependencies pinned by upstream crates; we cannot control their versions.
+[[bans.skip]]
+name = "darling"
+
+[[bans.skip]]
+name = "spin"
+
+# Supply-chain policy (docs/SUPPLY_CHAIN_POLICY.md): crates.io is the only allowed source.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+# Only licenses that actually appear in the current dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    # NCSA: libfuzzer-sys (fuzz harness only).
+    "NCSA",
+    # 0BSD: quoted_printable via lettre (analytics API mail).
+    "0BSD",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

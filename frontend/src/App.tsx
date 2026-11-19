@@ -1,0 +1,742 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Link,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import { CreateProposalModal } from "./components/CreateProposalModal";
+import { CreateRecurringPaymentModal } from "./components/CreateRecurringPaymentModal";
+import { ErrorState } from "./components/ErrorState";
+import { GlobalSearch } from "./components/GlobalSearch";
+import { GrantRevokeRoleModal } from "./components/GrantRevokeRoleModal";
+import { LoadingState } from "./components/LoadingState";
+import { useContract } from "./hooks/useContract";
+import { useEventPolling } from "./hooks/useEventPolling";
+import { useNotifications } from "./hooks/useNotifications";
+import { useRoles } from "./hooks/useRoles";
+import { useWallet } from "./hooks/useWallet";
+import {
+  approveProposal,
+  executeProposal,
+  mapSubmissionError,
+  revokeProposal,
+} from "./lib/submit";
+import { isFrozen } from "./lib/contract";
+import { PWAInstallBanner } from "./components/PWAInstallBanner";
+import { ThemeControl } from "./components/ThemeControl";
+import { NotificationCenter } from "./components/NotificationCenter";
+import { LanguageSwitcher } from "./components/LanguageSwitcher";
+import { CommandPalette } from "./components/CommandPalette";
+import { ChangelogPanel } from "./components/ChangelogPanel";
+import { FeedbackWidget } from "./components/FeedbackWidget";
+import { LiveUpdatesAnnouncer } from "./components/LiveUpdatesAnnouncer";
+import { WalletSessionSwitcher } from "./components/WalletSessionSwitcher";
+import { isTypingTarget, type Command } from "./lib/commandPalette";
+import { applyTheme, getStoredTheme, subscribeToSystemTheme, type ThemeChoice } from "./lib/theme";
+import { AlertRulesPage } from "./pages/AlertRulesPage";
+import { AnalyticsPage } from "./pages/AnalyticsPage";
+import { BulkActionsPage } from "./pages/BulkActionsPage";
+import { DashboardPage } from "./pages/DashboardPage";
+import { FreshnessPage } from "./pages/FreshnessPage";
+import { HistoryPage } from "./pages/HistoryPage";
+import { NotFoundPage } from "./pages/NotFoundPage";
+import { NotificationSchedulePage } from "./pages/NotificationSchedulePage";
+import { OnboardingPage } from "./pages/OnboardingPage";
+import { OwnerAvailabilityPage } from "./pages/OwnerAvailabilityPage";
+import { OwnerProfilePage } from "./pages/OwnerProfilePage";
+import { OwnersPage } from "./pages/OwnersPage";
+import { ProposalDetailPage } from "./pages/ProposalDetailPage";
+import { RecurringPage } from "./pages/RecurringPage";
+import { SettingsPage } from "./pages/SettingsPage";
+import { TemplateMarketplacePage } from "./pages/TemplateMarketplacePage";
+import type { Proposal } from "./types/accord";
+
+const NAV_ITEMS = [
+  { key: "dashboard", to: "/app" },
+  { key: "bulk", to: "/app/bulk" },
+  { key: "recurring", to: "/app/recurring" },
+  { key: "history", to: "/app/history" },
+  { key: "audit", to: "/app/audit" },
+  { key: "analytics", to: "/app/analytics" },
+  { key: "owners", to: "/app/owners" },
+  { key: "availability", to: "/app/availability" },
+  { key: "templates", to: "/app/templates" },
+  { key: "notifications", to: "/app/notifications" },
+  { key: "alerts", to: "/app/alerts" },
+  { key: "freshness", to: "/app/freshness" },
+  { key: "settings", to: "/app/settings" },
+  { key: "docs", to: "/docs" },
+];
+
+type OptimisticPatch = {
+  id: number;
+  patch: Partial<Proposal>;
+};
+
+export default function App() {
+  const { t } = useTranslation();
+  const [showCreate, setShowCreate] = useState(false);
+  const [showCreateRecurring, setShowCreateRecurring] = useState(false);
+  const [roleModalTarget, setRoleModalTarget] = useState<string | null>(null);
+  const [txError, setTxError] = useState<string | null>(null);
+  const [txPending, setTxPending] = useState(false);
+  const [isStale, setIsStale] = useState(false);
+  const [contractFrozen, setContractFrozen] = useState(false);
+  const [theme, setTheme] = useState<ThemeChoice>(() => getStoredTheme());
+  // Ref to return focus to the "+ New" trigger after modal closes (Task 4)
+  const newProposalButtonRef = useRef<HTMLButtonElement>(null);
+  const recurringButtonRef = useRef<HTMLButtonElement>(null);
+
+  const wallet = useWallet();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const routeParams = useParams();
+
+  const {
+    proposals,
+    owners,
+    ownerAddresses,
+    stats,
+    loading,
+    error,
+    refresh,
+    optimisticUpdate,
+    lastSuccessAt,
+  } = useContract(wallet.address);
+
+  useEventPolling(refresh, 5000);
+  useNotifications(wallet.address, proposals);
+
+  // Apply theme with system mode subscription
+  useEffect(() => {
+    applyTheme(theme);
+    if (theme === "system") {
+      const unsubscribe = subscribeToSystemTheme(() => {
+        applyTheme("system");
+      });
+      return unsubscribe;
+    }
+  }, [theme]);
+
+  // Deep-link handling: ensure direct proposal URLs or query params open the correct page
+  useEffect(() => {
+    const directMatch = location.pathname.match(/^\/proposals\/(\d+)/);
+    if (directMatch) {
+      const id = directMatch[1];
+      navigate(`/app/proposals/${id}`, { replace: true });
+      return;
+    }
+
+    if (location.pathname === "/onboarding" || location.pathname === "/onboarding/") {
+      navigate("/app/onboarding", { replace: true });
+      return;
+    }
+
+    const params = new URLSearchParams(location.search);
+    const proposalParam = params.get("proposal");
+    if (proposalParam) {
+      navigate(`/app/proposals/${proposalParam}`, { replace: true });
+    }
+  }, [location.pathname, location.search, navigate]);
+
+  // Return focus to the New Proposal trigger when modal transitions from open → closed
+  const wasShowCreateRef = useRef(false);
+  useEffect(() => {
+    if (!showCreate && wasShowCreateRef.current) {
+      newProposalButtonRef.current?.focus();
+    }
+    wasShowCreateRef.current = showCreate;
+  }, [showCreate]);
+
+  // Return focus to the Recurring trigger when modal transitions from open → closed
+  const wasShowRecurringRef = useRef(false);
+  useEffect(() => {
+    if (!showCreateRecurring && wasShowRecurringRef.current) {
+      recurringButtonRef.current?.focus();
+    }
+    wasShowRecurringRef.current = showCreateRecurring;
+  }, [showCreateRecurring]);
+
+  // Adjust state during render (not in an effect) when the wallet drops mid-transaction.
+  if (!wallet.address && txPending) {
+    setTxPending(false);
+    setTxError("Wallet disconnected. Please reconnect and try again.");
+  }
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (lastSuccessAt) {
+        setIsStale(Date.now() - lastSuccessAt > 60000);
+      } else {
+        setIsStale(false);
+      }
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [lastSuccessAt]);
+
+  // Poll frozen state
+  useEffect(() => {
+    let cancelled = false;
+    async function check() {
+      try {
+        const f = await isFrozen();
+        if (!cancelled) setContractFrozen(f);
+      } catch {
+        // ignore
+      }
+    }
+    check();
+    const interval = setInterval(check, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [lastSuccessAt]);
+
+  const activeProposals = useMemo(
+    () =>
+      proposals.filter((proposal) =>
+        ["pending", "ready"].includes(proposal.status),
+      ),
+    [proposals]
+  );
+  const walletRoles = useRoles({
+    walletAddress: wallet.address,
+    ownerAddresses,
+    loading,
+    error,
+  });
+
+  const { address, connect } = wallet;
+
+  const ownerWeightForWallet = useCallback(
+    (addr: string | null | undefined) => {
+      if (!addr) return 0;
+      const index = ownerAddresses.indexOf(addr);
+      return index >= 0 ? owners[index]?.weight ?? 0 : 0;
+    },
+    [ownerAddresses, owners]
+  );
+
+  const withTx = useCallback(
+    async (
+      fn: () => Promise<void>,
+      optimisticPatch?: OptimisticPatch
+    ) => {
+      if (!address) {
+        await connect();
+        return;
+      }
+
+      setTxError(null);
+      setTxPending(true);
+
+      if (optimisticPatch) {
+        optimisticUpdate(optimisticPatch.id, optimisticPatch.patch);
+      }
+
+      try {
+        await fn();
+        refresh();
+      } catch (err) {
+        setTxError(err instanceof Error ? err.message : "Transaction failed");
+      } finally {
+        setTxPending(false);
+      }
+    },
+    [address, connect, optimisticUpdate, refresh]
+  );
+
+  const handleApprove = useCallback((id: number) => {
+    const proposal = proposals.find((candidate) => candidate.id === id);
+    if (!proposal) {
+      return withTx(() => approveProposal(wallet.address!, id));
+    }
+
+    const myWeight = ownerWeightForWallet(wallet.address);
+    const approvals = proposal.approvals + 1;
+    const approvalWeight = (proposal.approvalWeight ?? 0) + myWeight;
+    const quorumWeight = proposal.quorumWeight ?? proposal.threshold;
+    const status = approvalWeight >= quorumWeight ? "ready" : proposal.status;
+
+    return withTx(() => approveProposal(wallet.address!, id), {
+      id,
+      patch: {
+        approvals,
+        approvalWeight,
+        status,
+        userHasApproved: true,
+      },
+    });
+  }, [ownerWeightForWallet, proposals, wallet.address, withTx]);
+
+  const handleExecute = useCallback((id: number) =>
+    withTx(() => executeProposal(wallet.address!, id), {
+      id,
+      patch: { status: "executed" },
+    }), [wallet.address, withTx]);
+
+  const handleRevoke = useCallback((id: number) => {
+    const proposal = proposals.find((candidate) => candidate.id === id);
+    if (!proposal) {
+      return withTx(() => revokeProposal(wallet.address!, id));
+    }
+
+    const myWeight = ownerWeightForWallet(wallet.address);
+    const approvals = Math.max(proposal.approvals - 1, 0);
+    const approvalWeight = Math.max((proposal.approvalWeight ?? 0) - myWeight, 0);
+    const quorumWeight = proposal.quorumWeight ?? proposal.threshold;
+
+    const status =
+      approvalWeight >= quorumWeight && proposal.status === "ready"
+        ? "ready"
+        : "pending";
+
+    return withTx(() => revokeProposal(wallet.address!, id), {
+      id,
+      patch: {
+        approvals,
+        approvalWeight,
+        status,
+        userHasApproved: false,
+      },
+    });
+  }, [ownerWeightForWallet, proposals, wallet.address, withTx]);
+
+  // Bulk actions submit each proposal as its own transaction and must surface
+  // per-item failures, so they bypass withTx (which swallows errors).
+  const bulkApprove = useCallback(async (id: number) => {
+    if (!wallet.address) throw new Error("Connect a wallet to sign transactions.");
+    try {
+      await approveProposal(wallet.address, id);
+    } catch (err) {
+      throw new Error(mapSubmissionError(err), { cause: err });
+    }
+  }, [wallet.address]);
+
+  const bulkExecute = useCallback(async (id: number) => {
+    if (!wallet.address) throw new Error("Connect a wallet to sign transactions.");
+    try {
+      await executeProposal(wallet.address, id);
+    } catch (err) {
+      throw new Error(mapSubmissionError(err), { cause: err });
+    }
+  }, [wallet.address]);
+
+  const thresholdStat = stats.find((stat) => stat.label === "Threshold");
+  const threshold = Number.parseInt(
+    thresholdStat?.value.split(" ")[0] ?? "0",
+    10,
+  );
+
+  function shortenAddr(addr: string) {
+    return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+  }
+
+  const anyModalOpen = showCreate || showCreateRecurring || roleModalTarget !== null;
+
+  const commands: Command[] = useMemo(() => {
+    const navigateCommands: Command[] = NAV_ITEMS.map(({ key, to }) => ({
+      id: `nav-${key}`,
+      title: `Go to ${t(`nav.${key}`)}`,
+      subtitle: to,
+      group: "navigate",
+      keywords: [key, to],
+      perform: () => navigate(to),
+    }));
+
+    const actionCommands: Command[] = [
+      {
+        id: "action-new-proposal",
+        title: "New Proposal",
+        subtitle: "Create a transfer, owner, or threshold proposal",
+        group: "action",
+        keywords: ["create", "transfer", "payment"],
+        shortcut: "N",
+        perform: () => setShowCreate(true),
+      },
+      {
+        id: "action-new-recurring",
+        title: "New Recurring Payment",
+        subtitle: "Create a scheduled or vested payment proposal",
+        group: "action",
+        keywords: ["create", "recurring", "schedule", "vesting", "payroll"],
+        shortcut: "R",
+        perform: () => setShowCreateRecurring(true),
+      },
+      {
+        id: "action-theme-light",
+        title: "Switch to Light Theme",
+        group: "action",
+        keywords: ["theme", "appearance", "light"],
+        perform: () => setTheme("light"),
+      },
+      {
+        id: "action-theme-dark",
+        title: "Switch to Dark Theme",
+        group: "action",
+        keywords: ["theme", "appearance", "dark"],
+        perform: () => setTheme("dark"),
+      },
+      {
+        id: "action-theme-system",
+        title: "Use System Theme",
+        group: "action",
+        keywords: ["theme", "appearance", "system", "auto"],
+        perform: () => setTheme("system"),
+      },
+    ];
+
+    if (wallet.address) {
+      actionCommands.push({
+        id: "action-disconnect-wallet",
+        title: "Disconnect Wallet",
+        subtitle: shortenAddr(wallet.address),
+        group: "action",
+        keywords: ["wallet", "freighter", "logout"],
+        perform: () => wallet.disconnect(),
+      });
+    } else if (wallet.installed) {
+      actionCommands.push({
+        id: "action-connect-wallet",
+        title: "Connect Wallet",
+        group: "action",
+        keywords: ["wallet", "freighter", "login"],
+        perform: () => wallet.connect(),
+      });
+    }
+
+    return [...navigateCommands, ...actionCommands];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navigate, t, wallet.address, wallet.installed]);
+
+  // Direct single-key shortcuts for the two most common actions. Ignored
+  // while typing in a field or while another modal is already open, so they
+  // never hijack normal text entry or stack on top of an open dialog.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey || isTypingTarget(event.target)) return;
+      if (anyModalOpen) return;
+
+      if (event.key === "n" || event.key === "N") {
+        event.preventDefault();
+        setShowCreate(true);
+      } else if (event.key === "r" || event.key === "R") {
+        event.preventDefault();
+        setShowCreateRecurring(true);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [anyModalOpen]);
+
+  return (
+    <div className="min-h-screen bg-white dark:bg-zinc-950 text-zinc-900 dark:text-white">
+      <LiveUpdatesAnnouncer proposals={proposals} />
+      <PWAInstallBanner />
+      <CommandPalette commands={commands} suspended={anyModalOpen} />
+      <header className="border-b border-zinc-800 dark:border-zinc-800 border-zinc-200 bg-white dark:bg-zinc-950 px-4 sm:px-6 py-4">
+        <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-2">
+          <Link
+            to="/"
+            className="flex shrink-0 items-center gap-3 transition-opacity hover:opacity-80"
+          >
+            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-500 text-xs font-bold text-black">
+              A
+            </div>
+            <span className="font-semibold tracking-tight">Accord</span>
+            <span className="hidden font-mono text-xs text-zinc-400 sm:block">
+              {t("header.network")}
+            </span>
+          </Link>
+
+          <GlobalSearch proposals={proposals} owners={owners} />
+
+          <nav className="order-last flex w-full flex-wrap items-center justify-end gap-1 pt-1">
+            {NAV_ITEMS.map(({ key, to }) => (
+              <Link
+                key={key}
+                to={to}
+                className={`rounded-lg px-3 py-1.5 text-sm capitalize transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-400 ${
+                  location.pathname === to ||
+                  (to === "/app" && location.pathname === "/app/")
+                    ? "bg-zinc-800 text-white"
+                    : "text-zinc-400 hover:text-zinc-300"
+                }`}
+              >
+                {t(`nav.${key}`)}
+              </Link>
+            ))}
+
+            {/* Explicit Light, System, Dark theme control */}
+            <ThemeControl
+              currentTheme={theme}
+              onThemeChange={setTheme}
+              className="ms-1"
+            />
+
+            <LanguageSwitcher className="ms-1" />
+          </nav>
+
+          <ChangelogPanel />
+          <FeedbackWidget walletAddress={wallet.address} />
+          <NotificationCenter />
+
+          <WalletSessionSwitcher wallet={wallet} />
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-4xl px-4 sm:px-6 py-8">
+        {contractFrozen && (
+          <div className="mb-6 rounded-xl border border-red-500/30 bg-red-500/20 px-4 py-3 text-sm text-red-300 font-medium flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 shrink-0">
+              <path fillRule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003zM12 8.25a.75.75 0 01.75.75v3.75a.75.75 0 01-1.5 0V9a.75.75 0 01.75-.75zm0 8.25a.75.75 0 100-1.5.75.75 0 000 1.5z" clipRule="evenodd" />
+            </svg>
+            Contract is currently frozen. All proposal creation and execution has been paused.
+          </div>
+        )}
+
+        {isStale && !loading && (
+          <div className="mb-6 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-400 font-medium">
+            Data may be out of date — last updated over 60 seconds ago.
+          </div>
+        )}
+
+        {txError && (
+          <ErrorState
+            message={txError}
+            variant="banner"
+            onRetry={() => {
+              setTxError(null);
+              refresh();
+            }}
+            onDismiss={() => setTxError(null)}
+          />
+        )}
+
+        {wallet.networkMismatch && (
+          <div className="mb-6 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-400">
+            Your wallet network does not match this app. Expected network:{" "}
+            {import.meta.env.VITE_NETWORK_PASSPHRASE}. Switch Freighter network
+            to continue.
+          </div>
+        )}
+
+        {txPending && (
+          <div className="mb-6 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-400">
+            Waiting for confirmation…
+          </div>
+        )}
+
+        {loading ? (
+          <LoadingState message="Loading contract data…" />
+        ) : (
+          <>
+            {owners.length === 0 && location.pathname !== "/app/onboarding" && (
+              <div
+                data-testid="no-multisig-banner"
+                className="mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-xs text-emerald-200"
+              >
+                <div>
+                  <p className="font-semibold text-emerald-300 text-sm">
+                    {t("onboarding.bannerTitle", "No multisig configured yet")}
+                  </p>
+                  <p className="text-zinc-400 mt-0.5">
+                    {t(
+                      "onboarding.bannerDesc",
+                      "Take the guided onboarding wizard to configure owners, quorum threshold, and your first proposal.",
+                    )}
+                  </p>
+                </div>
+                <Link
+                  to="/app/onboarding"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-black hover:bg-emerald-400 transition-colors shrink-0"
+                >
+                  {t("onboarding.bannerCta", "Start Setup Wizard →")}
+                </Link>
+              </div>
+            )}
+            <Routes>
+              <Route
+                path="onboarding"
+                element={<OnboardingPage wallet={wallet} onComplete={refresh} />}
+              />
+              <Route
+                index
+              element={
+                routeParams.id ? (
+                  <ProposalDetailPage
+                    proposals={proposals}
+                    walletAddress={wallet.address}
+                    onApprove={handleApprove}
+                    onExecute={handleExecute}
+                  />
+                ) : (
+                  <DashboardPage
+                    activeProposals={activeProposals}
+                    owners={owners}
+                    dashboardStats={stats}
+                    walletAddress={wallet.address}
+                    onApprove={handleApprove}
+                    onExecute={handleExecute}
+                    onRevoke={handleRevoke}
+                    onCreateProposal={() => setShowCreate(true)}
+                    onCreateRecurringPayment={() => setShowCreateRecurring(true)}
+                    walletRoles={walletRoles.roles}
+                    roleBanner={walletRoles.banner}
+                    loading={loading}
+                    error={error}
+                    onRetry={refresh}
+                  />
+                )
+              }
+            />
+            <Route
+              path="history"
+              element={
+                <HistoryPage proposals={proposals} onApprove={handleApprove} />
+              }
+            />
+            <Route path="audit" element={<AuditLogPage proposals={proposals} />} />
+            <Route
+              path="recurring"
+              element={
+                <RecurringPage walletAddress={wallet.address} />
+              }
+            />
+            <Route path="analytics" element={<AnalyticsPage />} />
+            <Route
+              path="bulk"
+              element={
+                <BulkActionsPage
+                  proposals={proposals}
+                  walletAddress={wallet.address}
+                  onApprove={bulkApprove}
+                  onExecute={bulkExecute}
+                  onBatchComplete={refresh}
+                  onConnectWallet={wallet.connect}
+                  loading={loading}
+                  error={error}
+                  onRetry={refresh}
+                />
+              }
+            />
+            <Route path="templates" element={<TemplateMarketplacePage />} />
+            <Route
+              path="availability"
+              element={
+                <OwnerAvailabilityPage
+                  owners={owners}
+                  proposals={proposals}
+                  loading={loading}
+                  error={error}
+                  onRetry={refresh}
+                />
+              }
+            />
+            <Route path="notifications" element={<NotificationSchedulePage />} />
+            <Route path="alerts" element={<AlertRulesPage />} />
+            <Route path="freshness" element={<FreshnessPage />} />
+            <Route
+              path="owners"
+              element={
+                <OwnersPage
+                  owners={owners}
+                  ownerAddresses={ownerAddresses}
+                  threshold={threshold}
+                  totalOwners={owners.length}
+                  onManageRoles={setRoleModalTarget}
+                  walletAddress={wallet.address}
+                  onProposalSubmitted={refresh}
+                />
+              }
+            />
+            <Route
+              path="settings"
+              element={
+                <SettingsPage
+                  stats={stats}
+                  walletAddress={wallet.address}
+                  ownerAddresses={ownerAddresses}
+                  onProposalSubmitted={refresh}
+                />
+              }
+            />
+            <Route
+              path="owners/:address"
+              element={
+                <OwnerProfilePage
+                  proposals={proposals}
+                  owners={owners}
+                  walletAddress={wallet.address}
+                  walletRoles={walletRoles.roles}
+                  onApprove={handleApprove}
+                  onExecute={handleExecute}
+                  onRevoke={handleRevoke}
+                />
+              }
+            />
+            <Route
+              path="settings"
+              element={
+                <SettingsPage
+                  stats={stats}
+                  walletAddress={wallet.address}
+                  ownerAddresses={ownerAddresses}
+                  onProposalSubmitted={refresh}
+                />
+              }
+            />
+            <Route
+              path="proposals/:id"
+              element={
+                <ProposalDetailPage
+                  proposals={proposals}
+                  walletAddress={wallet.address}
+                  onApprove={handleApprove}
+                  onExecute={handleExecute}
+                />
+              }
+            />
+            <Route
+              path="*"
+              element={<NotFoundPage onGoHome={() => navigate("/app")} />}
+            />
+          </Routes>
+        </>
+      )}
+      </main>
+      
+      {showCreate && (
+        <CreateProposalModal
+          walletAddress={wallet.address}
+          onClose={() => setShowCreate(false)}
+          onSubmitted={refresh}
+          triggerRef={newProposalButtonRef}
+        />
+      )}
+      {showCreateRecurring && (
+        <CreateRecurringPaymentModal
+          walletAddress={wallet.address}
+          onClose={() => setShowCreateRecurring(false)}
+          onSubmitted={refresh}
+          triggerRef={recurringButtonRef}
+        />
+      )}
+      {roleModalTarget && (
+        <GrantRevokeRoleModal
+          walletAddress={wallet.address}
+          ownerAddresses={ownerAddresses}
+          threshold={threshold}
+          initialTargetAddress={roleModalTarget}
+          onClose={() => setRoleModalTarget(null)}
+          onSubmitted={refresh}
+        />
+      )}
+    </div>
+  );
+}
